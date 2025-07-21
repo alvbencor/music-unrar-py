@@ -1,0 +1,114 @@
+
+#!/usr/bin/env python3
+# music-unrar-py.py
+
+import subprocess
+import requests
+import difflib
+import re
+from pathlib import Path
+
+EXTRACTOR = r"C:\Program Files\7-Zip\7z.exe"
+AUDIO_EXTS = {'.mp3', '.flac', '.wav'}
+ARCHIVE_EXTS = {'.rar', '.zip'}
+HEADERS = {"User-Agent": "MusicRenamerBot/1.0"}
+OUTDIR = Path("descomprimidos")
+
+def clean_name(filename):
+    s = Path(filename).stem
+    s = re.sub(r'[_]+', ' ', s)  # guiones bajos → espacio
+    s = re.sub(r'\.+', '.', s)  # varios puntos → uno solo
+    s = re.sub(r'[\.]+', ' ', s)  # puntos sueltos → espacio
+    s = re.sub(r'^(\d+[\-\.\s]*)+', '', s)
+    s = re.sub(r'\b(by|rip(?:ped)?\s+by)\s+[a-z0-9 ]{2,}$', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\b[a-z0-9.-]+\.(com|net|org|es)\b', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'[\[(]por .*?[\])]', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'[\[(].*?by .*?[\])]', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\s*-\s*Pg\.?\s*\d+,?$', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'[\[\{].*?[\]\}]', '', s)
+    s = re.sub(r'\s{2,}', ' ', s)
+    s = re.sub(r'[\\/:*?"<>|]', '_', s)
+    return s.strip() or Path(filename).stem
+
+def sanitize_folder_name(name):
+    return re.sub(r'[\\/:*?"<>|]', '_', name).strip()
+
+def list_tracks_in_archive(archive_path):
+    result = subprocess.run([EXTRACTOR, "l", str(archive_path)], capture_output=True, text=True)
+    lines = result.stdout.splitlines()
+    audio_files = [line for line in lines if any(ext in line.lower() for ext in AUDIO_EXTS)]
+    return len(audio_files)
+
+def similarity(a, b):
+    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+def get_best_metadata(search_query, expected_tracks):
+    url = "https://musicbrainz.org/ws/2/release/"
+    params = {'query': search_query, 'fmt': 'json'}
+    resp = requests.get(url, params=params, headers={"User-Agent": "MusicUnarchiver/1.0"})
+    if not resp.ok:
+        return None
+
+    releases = resp.json().get("releases", [])
+    for release in releases:
+        release_id = release.get("id")
+        title = release.get("title", "")
+        artist = release.get("artist-credit", [{}])[0].get("name", "")
+        date = release.get("date", "????")[:4]
+
+        rec_url = f"https://musicbrainz.org/ws/2/release/{release_id}?inc=recordings&fmt=json"
+        r = requests.get(rec_url, headers=HEADERS)
+        if not r.ok:
+            continue
+        media = r.json().get("media", [])
+        track_count = sum(len(m.get("tracks", [])) for m in media)
+        if track_count != expected_tracks:
+            continue
+
+        score_title = similarity(title, search_query)
+        score_artist = similarity(artist, search_query)
+        if score_title > 0.6 or score_artist > 0.6:
+            return f"{artist} - {title} - {date}"
+    return None
+
+def extract_archive_to_folder(archive_path, target_folder):
+    target_folder.mkdir(parents=True, exist_ok=True)
+    cmd = [EXTRACTOR, "x", str(archive_path), f"-o{target_folder}", "-y"]
+    subprocess.run(cmd, check=True)
+
+def main():
+    base_dir = Path(".").resolve()
+    OUTDIR.mkdir(exist_ok=True)
+
+    archive_files = [f for f in base_dir.iterdir() if f.suffix.lower() in ARCHIVE_EXTS]
+    if not archive_files:
+        print("No se encontraron archivos comprimidos .rar/.zip en el directorio.")
+        return
+
+    for archive in archive_files:
+        print(f"🎧 Procesando: {archive.name}")
+        clean = clean_name(archive.name)
+        track_count = list_tracks_in_archive(archive)
+        print(f"   → {track_count} pistas detectadas")
+
+        metadata = get_best_metadata(clean, track_count)
+        if metadata:
+            print(f"   ✔ Coincidencia con MusicBrainz: {metadata}")
+        else:
+            print(f"   ⚠ No se encontró coincidencia, se usará nombre limpio.")
+
+        folder_name = sanitize_folder_name(metadata or clean)
+        dest_folder = OUTDIR / folder_name
+
+        try:
+            extract_archive_to_folder(archive, dest_folder)
+            print(f"   ✔ Extraído en: {dest_folder}")
+            archive.unlink()
+            print(f"   🗑️  Archivo eliminado: {archive.name}\n")
+        except Exception as e:
+            print(f"   ✖ Error al extraer: {e}\n")
+
+    print(f"✅ ¡Todo listo! Comprueba tus carpetas en: {OUTDIR}")
+
+if __name__ == "__main__":
+    main()
