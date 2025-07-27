@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # music-unrar-py.py
 
@@ -6,19 +5,30 @@ import subprocess
 import requests
 import difflib
 import re
+import logging
+import sys
 from pathlib import Path
+from requests.exceptions import RequestException
+from subprocess import CalledProcessError
 
-EXTRACTOR = r"C:\Program Files\7-Zip\7z.exe"
-AUDIO_EXTS = {'.mp3', '.flac', '.wav'}
+# --- Configuración de logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s: %(message)s',
+    datefmt='%H:%M:%S'
+)
+
+EXTRACTOR    = r"C:\Program Files\7-Zip\7z.exe"
+AUDIO_EXTS   = {'.mp3', '.flac', '.wav'}
 ARCHIVE_EXTS = {'.rar', '.zip'}
-HEADERS = {"User-Agent": "MusicRenamerBot/1.0"}
-OUTDIR = Path("descomprimidos")
+HEADERS      = {"User-Agent": "MusicUnrarBot/1.0"}
+OUTDIR       = Path("descomprimidos")
 
 def clean_name(filename):
     s = Path(filename).stem
-    s = re.sub(r'[_]+', ' ', s)  # guiones bajos → espacio
-    s = re.sub(r'\.+', '.', s)  # varios puntos → uno solo
-    s = re.sub(r'[\.]+', ' ', s)  # puntos sueltos → espacio
+    s = re.sub(r'[_]+', ' ', s)
+    s = re.sub(r'\.+', '.', s)
+    s = re.sub(r'[\.]+', ' ', s)
     s = re.sub(r'^(\d+[\-\.\s]*)+', '', s)
     s = re.sub(r'\b(by|rip(?:ped)?\s+by)\s+[a-z0-9 ]{2,}$', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\b[a-z0-9.-]+\.(com|net|org|es)\b', '', s, flags=re.IGNORECASE)
@@ -34,81 +44,131 @@ def sanitize_folder_name(name):
     return re.sub(r'[\\/:*?"<>|]', '_', name).strip()
 
 def list_tracks_in_archive(archive_path):
-    result = subprocess.run([EXTRACTOR, "l", str(archive_path)], capture_output=True, text=True)
-    lines = result.stdout.splitlines()
-    audio_files = [line for line in lines if any(ext in line.lower() for ext in AUDIO_EXTS)]
-    return len(audio_files)
+    try:
+        result = subprocess.run(
+            [EXTRACTOR, "l", str(archive_path)],
+            capture_output=True, text=True, check=True
+        )
+    except CalledProcessError as e:
+        logging.error(f"No pude listar {archive_path.name}: {e}")
+        return 0
+    return sum(1 for line in result.stdout.splitlines()
+               if any(ext in line.lower() for ext in AUDIO_EXTS))
 
 def similarity(a, b):
     return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 def get_best_metadata(search_query, expected_tracks):
-    url = "https://musicbrainz.org/ws/2/release/"
-    params = {'query': search_query, 'fmt': 'json'}
-    resp = requests.get(url, params=params, headers={"User-Agent": "MusicUnarchiver/1.0"})
-    if not resp.ok:
+    try:
+        resp = requests.get(
+            "https://musicbrainz.org/ws/2/release/",
+            params={'query': search_query, 'fmt': 'json'},
+            headers=HEADERS,
+            timeout=10
+        )
+        resp.raise_for_status()
+    except RequestException as e:
+        logging.warning(f"MusicBrainz fallo en búsqueda '{search_query}': {e}")
         return None
 
-    releases = resp.json().get("releases", [])
-    for release in releases:
-        release_id = release.get("id")
-        title = release.get("title", "")
+    for release in resp.json().get("releases", []):
+        rid    = release.get("id")
+        title  = release.get("title", "")
         artist = release.get("artist-credit", [{}])[0].get("name", "")
-        date = release.get("date", "????")[:4]
+        date   = release.get("date", "")[:4] or "????"
 
-        rec_url = f"https://musicbrainz.org/ws/2/release/{release_id}?inc=recordings&fmt=json"
-        r = requests.get(rec_url, headers=HEADERS)
-        if not r.ok:
+        try:
+            r = requests.get(
+                f"https://musicbrainz.org/ws/2/release/{rid}",
+                params={'inc': 'recordings', 'fmt': 'json'},
+                headers=HEADERS,
+                timeout=10
+            )
+            r.raise_for_status()
+        except RequestException:
             continue
-        media = r.json().get("media", [])
-        track_count = sum(len(m.get("tracks", [])) for m in media)
+
+        track_count = sum(len(m.get("tracks", [])) for m in r.json().get("media", []))
         if track_count != expected_tracks:
             continue
 
-        score_title = similarity(title, search_query)
-        score_artist = similarity(artist, search_query)
-        if score_title > 0.6 or score_artist > 0.6:
+        if similarity(title, search_query) > 0.6 or similarity(artist, search_query) > 0.6:
             return f"{artist} - {title} - {date}"
     return None
 
 def extract_archive_to_folder(archive_path, target_folder):
     target_folder.mkdir(parents=True, exist_ok=True)
-    cmd = [EXTRACTOR, "x", str(archive_path), f"-o{target_folder}", "-y"]
-    subprocess.run(cmd, check=True)
+    subprocess.run([EXTRACTOR, "x", str(archive_path), f"-o{target_folder}", "-y"], check=True)
 
 def main():
-    base_dir = Path(".").resolve()
     OUTDIR.mkdir(exist_ok=True)
+    archives = [f for f in Path(".").iterdir() if f.suffix.lower() in ARCHIVE_EXTS]
 
-    archive_files = [f for f in base_dir.iterdir() if f.suffix.lower() in ARCHIVE_EXTS]
-    if not archive_files:
-        print("No se encontraron archivos comprimidos .rar/.zip en el directorio.")
+    if not archives:
+        logging.info("No se encontraron archivos .rar/.zip.")
         return
 
-    for archive in archive_files:
-        print(f"🎧 Procesando: {archive.name}")
-        clean = clean_name(archive.name)
-        track_count = list_tracks_in_archive(archive)
-        print(f"   → {track_count} pistas detectadas")
+    errors = []
+    unchanged = []
 
-        metadata = get_best_metadata(clean, track_count)
-        if metadata:
-            print(f"   ✔ Coincidencia con MusicBrainz: {metadata}")
-        else:
-            print(f"   ⚠ No se encontró coincidencia, se usará nombre limpio.")
-
-        folder_name = sanitize_folder_name(metadata or clean)
-        dest_folder = OUTDIR / folder_name
-
+    for archive in archives:
+        raw_stem = archive.stem
         try:
-            extract_archive_to_folder(archive, dest_folder)
-            print(f"   ✔ Extraído en: {dest_folder}")
-            archive.unlink()
-            print(f"   🗑️  Archivo eliminado: {archive.name}\n")
-        except Exception as e:
-            print(f"   ✖ Error al extraer: {e}\n")
+            logging.info(f"Procesando: {archive.name}")
 
-    print(f"✅ ¡Todo listo! Comprueba tus carpetas en: {OUTDIR}")
+            # 1) Nombre limpio
+            clean = clean_name(archive.name)
+
+            # 2) Cuenta pistas
+            tracks = list_tracks_in_archive(archive)
+            logging.info(f"  → {tracks} pistas detectadas")
+
+            # 3) Metadata
+            metadata = get_best_metadata(clean, tracks)
+            if metadata:
+                logging.info(f"  ✔ Metadata encontrada: {metadata}")
+                chosen_name = metadata
+            else:
+                logging.info("  ⚠ Sin metadata, usando nombre limpio")
+                chosen_name = clean
+
+            # Detectar si no se modificó el nombre
+            if chosen_name == raw_stem:
+                unchanged.append(archive.name)
+
+            # 4) Extraer
+            folder_name = sanitize_folder_name(chosen_name)
+            dest = OUTDIR / folder_name
+            extract_archive_to_folder(archive, dest)
+            logging.info(f"  ✔ Extraído en: {dest}")
+
+            # 5) Borrar origen
+            archive.unlink()
+            logging.info(f"  🗑 Archivo eliminado: {archive.name}")
+
+        except Exception as e:
+            logging.error(f"✖ Error procesando {archive.name}: {e}")
+            errors.append(archive.name)
+            continue
+
+    # Listados finales
+    if errors:
+        logging.info("Archivos con error:")
+        for name in errors:
+            logging.info(f"  - {name}")
+    else:
+        logging.info("No hubo errores.")
+
+    if unchanged:
+        logging.info("Archivos sin modificación de nombre:")
+        for name in unchanged:
+            logging.info(f"  - {name}")
+    else:
+        logging.info("Todos los archivos tuvieron nombre modificado.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logging.critical(f"Fatal: {e}")
+        sys.exit(1)
